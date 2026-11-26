@@ -1,0 +1,32 @@
+{
+  "machine": "picokvm",
+  "vendor": "Luckfox",
+  "name": "PicoKVM",
+  "capabilities": {
+    "audio": true,
+    "h264_high": true,
+    "recovery": true
+  },
+  "defaults": {
+    "network.hostname": "onekvm-picokvm",
+    "video.fps": "60",
+    "audio.enabled": "false",
+    "audio.device": "hw:UAC1Gadget,0",
+    "audio.source": "hdmi"
+  },
+  "screen_display": {
+    "icon_columns": 3,
+    "icon_rows": 3,
+    "icon_size": 52,
+    "list_rows": 4,
+    "keyboard": "nine",
+    "keyboard_layout": "picokvm.json"
+  },
+  "fixed": {
+    "video.source_device": "/dev/video0",
+    "audio.enabled": "false",
+    "audio.microphone": "false"
+  },
+  "processor": "ARM Cortex-A7",
+  "soc_name": "RV1106"
+}

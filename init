@@ -1,0 +1,310 @@
+#!/bin/sh
+# PicoKVM initramfs: keep the boot screen moving, run the shared OneKVM
+# Recovery check, mount the read-only slot root below an overlay on userdata
+# and hand over to systemd.
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+mkdir -p /dev /proc /sys /run
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs -o mode=0755,nodev,nosuid tmpfs /run
+mkdir -p /newroot /rofs /userdata
+
+fail() {
+    echo "OneKVM PicoKVM: $*; restarting in 10 s"
+    sleep 10
+    reboot -f
+}
+
+# wait_for PATH TENTHS: true once PATH exists, polling every 0.1 s.
+wait_for() {
+    tries=0
+    until [ -e "$1" ]; do
+        tries=$((tries + 1))
+        [ "$tries" -le "$2" ] || return 1
+        usleep 100000
+    done
+}
+
+# OneKVM U-Boot passes the slot it loaded as rauc.slot; the OneKVM services
+# read the same value.
+boot_slot() {
+    slot=A
+    for argument in $1; do
+        case "$argument" in
+            rauc.slot=A) slot=A ;;
+            rauc.slot=B) slot=B ;;
+        esac
+    done
+    echo "$slot"
+}
+
+# The initramfs BusyBox od has no -A/-t/-j/-N; hexdump has -s/-n/-e.
+bytes_hex() {
+    hexdump -v -s "$2" -n "$3" -e '1/1 "%02x"' "$1" 2>/dev/null
+}
+
+part_is() {
+    [ "$(cat "/sys/class/block/mmcblk1p$1/start" 2>/dev/null)" = "$2" ] &&
+        [ "$(cat "/sys/class/block/mmcblk1p$1/size" 2>/dev/null)" = "$3" ]
+}
+
+# Only the A/B layout written by build-sd.py: disk ID and exact slot geometry.
+ab_layout() {
+    [ "$(bytes_hex /dev/mmcblk1 440 4)" = 4b504b4f ] &&
+        part_is 1 32768 262144 && part_is 2 294912 524288 && part_is 3 819200 524288 &&
+        { [ ! -e /sys/class/block/mmcblk1p4 ] ||
+            [ "$(cat /sys/class/block/mmcblk1p4/start)" = 1343488 ]; }
+}
+
+# The tools come from the slot root: it creates userdata (p4) up to the card
+# end when the card has none and formats it only when blkid finds no
+# signature at all.
+prepare_userdata() {
+    mount --bind /dev /rofs/dev || return 1
+    mount -t proc proc /rofs/proc || { umount /rofs/dev; return 1; }
+    mount -t sysfs sysfs /rofs/sys || { umount /rofs/proc /rofs/dev; return 1; }
+    rc=0
+    chroot /rofs /usr/libexec/onekvm/picokvm-prepare-storage || rc=$?
+    umount /rofs/sys /rofs/proc /rofs/dev
+    return "$rc"
+}
+
+mount_userdata() {
+    mount -t ext4 -o noatime /dev/mmcblk1p4 /userdata 2>/dev/null && return
+    prepare_userdata && mount -t ext4 -o noatime /dev/mmcblk1p4 /userdata
+}
+
+# Linux marks a mounted read-write FAT32 volume dirty (bit 0 of byte 0x41)
+# until it unmounts; a power cut leaves the mark. Repair it before anything
+# mounts the boot partition. A failed repair is recorded for the Recovery
+# hook, which then neither counts this boot nor enters Recovery by itself.
+boot_fat_check() {
+    mkdir -p /run/onekvm-boot-fat
+    case "$(bytes_hex /dev/mmcblk1p1 65 1)" in
+        *[13579bdf]) ;;
+        *) return 0 ;;
+    esac
+    rc=0
+    fsck.fat -a -w /dev/mmcblk1p1 >/run/onekvm-boot-fat/fsck.log 2>&1 || rc=$?
+    case "$rc" in
+        0|1) echo 'OneKVM PicoKVM: boot partition was not cleanly unmounted; repaired' ;;
+        *)
+            echo failed >/run/onekvm-boot-fat/status
+            echo "OneKVM PicoKVM: boot partition check failed ($rc)" ;;
+    esac
+}
+
+# SquashFS bytes_used: le64 at offset 40; PicoKVM roots stay far below 4 GiB.
+squashfs_bytes() {
+    [ "$(bytes_hex "$1" 0 4)" = 68737173 ] && [ "$(bytes_hex "$1" 44 4)" = 00000000 ] &&
+        hexdump -s 40 -n 4 -e '1/4 "%u"' "$1" 2>/dev/null
+}
+
+# A card written from the SD image holds slot A's FIT, and the root image as a
+# file on the FAT. The first boot from slot A writes that file to both root
+# slots, then copies boot-a.itb to boot-b.itb as onekvm/install-b asks. Every
+# copy is read back from the card before its file goes, so an interrupted
+# install starts over at the next boot.
+install_fat=/run/onekvm-install
+root_file=$install_fat/onekvm/root.squashfs
+install_marker=$install_fat/onekvm/install-b
+
+# The initramfs dd takes only if/of/bs/count/skip/seek; stat reads the size
+# without reading the file.
+install_roots() {
+    # build-sd.py accepts only root images padded to 4 KiB, as mksquashfs pads them.
+    size=$(stat -c %s "$root_file") && used=$(squashfs_bytes "$root_file") && [ "$used" -gt 0 ] &&
+        [ "$used" -le "$size" ] && [ "$((size % 4096))" -eq 0 ] && [ "$size" -le 268435456 ] || return 1
+    echo 'OneKVM PicoKVM: installing the root system'
+    for part in 2 3; do
+        dd if="$root_file" of=/dev/mmcblk1p$part bs=1048576 2>/dev/null || return 1
+    done
+    sync
+    # Read the copies back from the card, not from the page cache.
+    echo 3 >/proc/sys/vm/drop_caches
+    image=$(sha256sum <"$root_file")
+    for part in 2 3; do
+        [ "$(dd if=/dev/mmcblk1p$part bs=4096 count=$((size / 4096)) 2>/dev/null | sha256sum)" = "$image" ] ||
+            return 1
+    done
+    mount -o remount,rw "$install_fat" && rm -f "$root_file" && sync
+}
+
+# Without boot-b.itb slot A still boots, with no slot to fall back to.
+install_slot_b() {
+    echo 'OneKVM PicoKVM: installing the slot B boot image'
+    mount -o remount,rw "$install_fat" || return 1
+    cp "$install_fat/boot-a.itb" "$install_fat/.boot-b.itb.new" || return 1
+    sync
+    echo 3 >/proc/sys/vm/drop_caches
+    [ "$(sha256sum <"$install_fat/boot-a.itb")" = "$(sha256sum <"$install_fat/.boot-b.itb.new")" ] ||
+        return 1
+    # FAT has no atomic replace: the complete copy is renamed into place.
+    mv -f "$install_fat/.boot-b.itb.new" "$install_fat/boot-b.itb" && sync &&
+        rm -f "$install_marker" && sync
+}
+
+# Fails only when the root slots could not be installed. Slot A boots only
+# from an installed root; the screen says what happens meanwhile.
+first_boot_install() {
+    [ "$slot" = A ] || return 0
+    mkdir -p "$install_fat"
+    mount -t vfat -o ro /dev/mmcblk1p1 "$install_fat" || return 0
+    if [ ! -e "$root_file" ] && [ ! -e "$install_marker" ]; then
+        umount "$install_fat"
+        return 0
+    fi
+    if [ -n "$splash" ]; then
+        onekvm-boot-splash finish || :
+        onekvm-boot-splash --message "$(printf 'Installing OneKVM\n\nDo not disconnect power.')" message || :
+    fi
+    rc=0
+    [ ! -e "$root_file" ] || install_roots || rc=1
+    if [ "$rc" = 0 ] && [ -e "$install_marker" ]; then
+        install_slot_b || echo 'OneKVM PicoKVM: slot B install failed; retrying at the next boot'
+    fi
+    umount "$install_fat" || rc=1
+    if [ -n "$splash" ]; then
+        onekvm-boot-splash --progress initramfs boot || :
+        onekvm-boot-splash animate </dev/null >/dev/null 2>&1 &
+    fi
+    return "$rc"
+}
+
+# The shared Recovery hook is an initramfs-framework module: it expects the
+# framework's console messages and fatal().
+msg() { echo "$@"; }
+info() { echo "$@"; }
+fatal() { echo "$@"; exit 1; }
+
+# Recovery screen text; $1 holds the IPv4 addresses, one per line.
+recovery_text() {
+    echo 'Recovery mode'
+    if [ -n "$1" ]; then
+        for address in $1; do echo "https://$address/"; done
+    else
+        echo 'Waiting for an IP address'
+    fi
+    echo
+    echo 'USB: the whole SD card is a drive. Write the OneKVM PicoKVM image to it, then restart.'
+}
+
+# Called by the hook once Recovery is chosen, and with its console banner
+# whenever the addresses change.
+picokvm_recovery_enter() {
+    [ -n "$splash" ] || return 0
+    onekvm-boot-splash finish || :
+    onekvm-boot-splash --message "$(recovery_text '')" recovery || :
+}
+
+picokvm_recovery_addresses() {
+    [ -n "$splash" ] || return 0
+    onekvm-boot-splash --message \
+        "$(recovery_text "$(printf '%s\n' "$1" | sed -n 's|^ *https://\([0-9.]*\)/$|\1|p')")" \
+        recovery || :
+}
+
+# For about a second after the USB PHY starts it tells a computer from a
+# charger, and a gadget bound meanwhile makes it settle on "charger" and switch
+# the port off. Wait for its answer; without a cable, give up after 5 s.
+picokvm_recovery_usb_ready() {
+    tries=0
+    until grep -qsE '^(SDP|CDP|DCP)=1$' /sys/class/extcon/extcon*/state; do
+        tries=$((tries + 1))
+        if [ "$tries" -gt 50 ]; then
+            echo 'OneKVM PicoKVM: no USB host detected; starting the Recovery USB gadget anyway'
+            return 0
+        fi
+        usleep 100000
+    done
+}
+
+# Explicit requests, the boot counter and factory reset run before any SD
+# partition is mounted. A hook failure ends only its subshell, so normal boot
+# continues. In Recovery the subshell never returns; the traps let BusyBox
+# reboot/poweroff, which signal PID 1, act from its console.
+recovery_check() {
+    [ -r /init.d/20-recovery ] || return 0
+    trap 'sync; reboot -f' TERM
+    trap 'sync; poweroff -f' USR2
+    trap 'sync; halt -f' USR1
+    (
+        bootparam_onekvm_recovery=
+        for argument in $(cat /proc/cmdline); do
+            case "$argument" in
+                onekvm_recovery=*|onekvm.recovery=*) bootparam_onekvm_recovery=${argument#*=} ;;
+            esac
+        done
+        . /init.d/20-recovery
+        recovery_board_enter() { picokvm_recovery_enter; }
+        recovery_board_addresses() { picokvm_recovery_addresses "$1"; }
+        recovery_board_usb_ready() { picokvm_recovery_usb_ready; }
+        ONEKVM_RECOVERY_USB_PRODUCT='OneKVM PicoKVM Recovery'
+        recovery_run
+    ) </dev/console &
+    wait $! || echo 'OneKVM PicoKVM: Recovery check failed; continuing normal boot'
+    trap - TERM USR1 USR2
+}
+
+# U-Boot left its boot screen on the panel; the bar continues from there. The
+# animator keeps it moving, survives switch_root and stops when the screen
+# service runs `finish`. Display errors never stop boot.
+splash=
+if wait_for /dev/fb0 20 && onekvm-boot-splash --progress initramfs boot; then
+    splash=1
+    onekvm-boot-splash animate </dev/null >/dev/null 2>&1 &
+fi
+
+slot=$(boot_slot "$(cat /proc/cmdline)")
+root=/dev/mmcblk1p2
+[ "$slot" = B ] && root=/dev/mmcblk1p3
+wait_for "$root" 100 || fail "slot $slot root $root not found"
+ab_layout || fail 'SD card is not the OneKVM PicoKVM A/B layout'
+boot_fat_check
+installed=1
+first_boot_install || installed=
+# Recovery checks all four partitions: a new card gets userdata first. The
+# tools come from the slot root, which is released again before Recovery.
+if [ -n "$installed" ] && [ ! -e /sys/class/block/mmcblk1p4 ] &&
+    mount -t squashfs -o ro "$root" /rofs; then
+    prepare_userdata || echo 'OneKVM PicoKVM: cannot create userdata partition'
+    umount /rofs || fail 'cannot release the slot root'
+fi
+# A failed install still counts towards automatic Recovery.
+recovery_check
+[ -n "$installed" ] || fail 'cannot install the root system'
+mount -t squashfs -o ro "$root" /rofs || fail "slot $slot root mount failed"
+# userdata (mmcblk1p4) holds the writable layer, /data and /mnt/storage.
+if ! mount_userdata; then
+    # Settings are not kept, but the device stays reachable and userdata is
+    # left untouched for repair.
+    echo 'OneKVM PicoKVM: userdata unavailable; changes last until reboot'
+    mount -t tmpfs -o mode=0755 tmpfs /userdata || fail 'cannot mount temporary userdata'
+    mkdir -p /run/onekvm && : >/run/onekvm/userdata-unavailable
+fi
+mkdir -p /userdata/upper /userdata/work /userdata/storage || fail 'cannot prepare userdata'
+# As on NanoKVM Pro and Go, retire image-owned upper files and record this
+# image and kernel in the upper, so persistence skips its per-file refresh.
+/usr/lib/onekvm/initramfs-kernel-overlay /rofs /userdata /userdata/upper "$slot" ||
+    echo 'OneKVM PicoKVM: image overlay refresh failed; persistence compares files instead'
+# A/B share upper/work; /data lives in the upper.
+mount -t overlay overlay -o lowerdir=/rofs,upperdir=/userdata/upper,workdir=/userdata/work /newroot ||
+    fail 'root overlay mount failed'
+# Resolve absolute /sbin/init symlinks inside the real root, not the initramfs.
+chroot /newroot /bin/sh -c 'test -x /sbin/init' || fail 'root has no init'
+# The slot root stays hidden at /mnt/.rofs, as on the other models.
+mkdir -p /newroot/mnt/.rofs /newroot/media/userdata /newroot/mnt/storage
+mount --bind /userdata/storage /newroot/mnt/storage &&
+    mount --move /userdata /newroot/media/userdata &&
+    mount --move /rofs /newroot/mnt/.rofs || fail 'cannot move slot mounts'
+# Before /dev moves; the root system's units mark the next checkpoints.
+[ -z "$splash" ] || onekvm-boot-splash progress storage || :
+for dir in dev proc sys run; do
+    mkdir -p "/newroot/$dir"
+    mount --move "/$dir" "/newroot/$dir" || fail "cannot move $dir"
+done
+echo "OneKVM PicoKVM: starting slot $slot from $root"
+exec switch_root /newroot /sbin/init
+fail 'switch_root failed'

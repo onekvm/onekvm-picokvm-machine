@@ -1,0 +1,47 @@
+#!/bin/sh
+# userdata (p4) runs from sector 1343488 to the card end. The SD image ends
+# where it starts, so a rewritten card keeps its userdata. On a new card,
+# create p4: sfdisk changes only the partition table in sector 0, and the
+# rest of the card stays as written. Create a file system only when blkid
+# finds no signature at all; anything it recognizes is left alone. The
+# initramfs runs this from the slot root before it mounts userdata.
+set -eu
+disk=/dev/mmcblk1
+part=${disk}p4
+start=1343488
+if [ ! -e /sys/class/block/mmcblk1p4 ]; then
+    sectors=$(cat /sys/class/block/mmcblk1/size)
+    # At least 256 MiB of userdata.
+    if [ $((sectors - start)) -lt 524288 ]; then
+        echo "the card has no room for userdata" >&2
+        exit 1
+    fi
+    echo "creating userdata partition"
+    # Never wipe signatures: a rewritten card keeps userdata at the same offset.
+    printf 'start=%s, type=83\n' "$start" |
+        sfdisk --no-reread --no-tell-kernel --wipe never --wipe-partitions never -q -N 4 "$disk"
+    partx --add --nr 4 "$disk"
+fi
+attempt=0
+until [ -b "$part" ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 10 ]; then
+        echo "$part did not appear" >&2
+        exit 1
+    fi
+    sleep 1
+done
+if [ "$(cat /sys/class/block/mmcblk1p4/start)" != "$start" ]; then
+    echo "$part does not start at sector $start" >&2
+    exit 1
+fi
+# -D: the MBR entry of p4 alone is no signature.
+rc=0
+blkid -p -D "$part" >/dev/null 2>&1 || rc=$?
+case "$rc" in
+0) exit 0 ;;
+2) ;;
+*) echo "blkid failed on $part (exit $rc)" >&2; exit 1 ;;
+esac
+echo "formatting $part as ext4 (userdata)"
+exec mkfs.ext4 -q -F -L userdata -m 0 -E lazy_itable_init=1,lazy_journal_init=1 "$part"
